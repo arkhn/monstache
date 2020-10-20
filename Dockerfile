@@ -22,8 +22,8 @@ RUN go build -buildmode=plugin -o fhirstore_map_documents.so fhirstore_map_docum
 
 FROM rwynn/monstache-alpine:3.11.3
 
-ENTRYPOINT ["/bin/monstache"]
-
 COPY --from=build-app /app/build/linux-amd64/monstache /bin/monstache
 
 COPY --from=build-app /app/fhirstore_map_documents.so /lib/fhirstore_map_documents.so
+
+ENTRYPOINT ["/bin/monstache", "-mapper-plugin-path", "/lib/fhirstore_map_documents.so"]
