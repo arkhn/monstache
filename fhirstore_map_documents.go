@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 
 	"github.com/rwynn/monstache/monstachemap"
 )
@@ -22,8 +21,7 @@ func Map(input *monstachemap.MapperPluginInput) (output *monstachemap.MapperPlug
 	}
 
 	res := map[string]interface{}{
-		"elastic_index": fmt.Sprintf("fhirstore.%s", resourceType),
-		resourceType:    doc,
+		resourceType: doc,
 	}
 
 	return &monstachemap.MapperPluginOutput{Document: res}, nil
