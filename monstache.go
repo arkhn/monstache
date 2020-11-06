@@ -40,8 +40,8 @@ import (
 	aws "github.com/olivere/elastic/v7/aws/v4"
 	"github.com/robertkrimen/otto"
 	_ "github.com/robertkrimen/otto/underscore"
-	"github.com/rwynn/gtm"
-	"github.com/rwynn/gtm/consistent"
+	"github.com/rwynn/gtm/v2"
+	"github.com/rwynn/gtm/v2/consistent"
 	"github.com/rwynn/monstache/monstachemap"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/bsontype"
@@ -80,7 +80,7 @@ var chunksRegex = regexp.MustCompile("\\.chunks$")
 var systemsRegex = regexp.MustCompile("system\\..+$")
 var exitStatus = 0
 
-const version = "6.6.0"
+const version = "6.7.0"
 const mongoURLDefault string = "mongodb://localhost:27017"
 const resumeNameDefault string = "default"
 const elasticMaxConnsDefault int = 4
@@ -203,6 +203,7 @@ type relation struct {
 type indexMapping struct {
 	Namespace string
 	Index     string
+	Pipeline  string
 }
 
 type findConf struct {
@@ -379,6 +380,7 @@ type configOptions struct {
 	DirectReadConcur         int            `toml:"direct-read-concur"`
 	DirectReadNoTimeout      bool           `toml:"direct-read-no-timeout"`
 	DirectReadBounded        bool           `toml:"direct-read-bounded"`
+	DirectReadStateful       bool           `toml:"direct-read-stateful"`
 	DirectReadExcludeRegex   string         `toml:"direct-read-dynamic-exclude-regex"`
 	MapperPluginPath         string         `toml:"mapper-plugin-path"`
 	EnableHTTPServer         bool           `toml:"enable-http-server"`
@@ -715,6 +717,9 @@ func (ic *indexClient) mapIndex(op *gtm.Op) *indexMapping {
 	if m := mapIndexTypes[op.Namespace]; m != nil {
 		if m.Index != "" {
 			mapping.Index = m.Index
+		}
+		if m.Pipeline != "" {
+			mapping.Pipeline = m.Pipeline
 		}
 	}
 	return mapping
@@ -1419,8 +1424,10 @@ func (ic *indexClient) enableProcess() (bool, error) {
 	_, err = col.InsertOne(context.Background(), doc)
 	if err == nil {
 		// update using $currentDate
-		ic.ensureEnabled()
-		return true, nil
+		_, err = ic.ensureEnabled()
+		if err == nil {
+			return true, nil
+		}
 	}
 	if isDup(err) {
 		return false, nil
@@ -1493,6 +1500,10 @@ func (ic *indexClient) ensureEnabled() (enabled bool, err error) {
 	return
 }
 
+func (ic *indexClient) pauseWork() {
+	ic.gtmCtx.Pause()
+}
+
 func (ic *indexClient) resumeWork() {
 	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("monstache")
 	result := col.FindOne(context.Background(), bson.M{
@@ -1505,17 +1516,6 @@ func (ic *indexClient) resumeWork() {
 				ts := doc["ts"].(primitive.Timestamp)
 				ic.gtmCtx.Since(ts)
 			}
-		}
-	}
-	drained := false
-	for !drained {
-		select {
-		case _, open := <-ic.gtmCtx.OpC:
-			if !open {
-				drained = true
-			}
-		default:
-			drained = true
 		}
 	}
 	ic.gtmCtx.Resume()
@@ -1565,6 +1565,63 @@ func (ic *indexClient) saveTimestamp() error {
 		"$set": doc,
 	}, opts)
 	return err
+}
+
+func (ic *indexClient) filterDirectReadNamespaces(wanted []string) (results []string, err error) {
+	results = make([]string, 0)
+	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("directreads")
+	filter := bson.M{
+		"_id": ic.config.ResumeName,
+	}
+	result := col.FindOne(context.Background(), filter)
+	if err = result.Err(); err == nil {
+		var doc struct {
+			Ns []string `bson:"ns"`
+		}
+		if err = result.Decode(&doc); err == nil {
+			var ns, skipped []string
+			if len(doc.Ns) > 0 {
+				ns = doc.Ns
+			}
+			for _, name := range wanted {
+				markedDone := false
+				for _, n := range ns {
+					if name == n {
+						markedDone = true
+						break
+					}
+				}
+				if !markedDone {
+					results = append(results, name)
+				} else {
+					skipped = append(skipped, name)
+				}
+			}
+			if len(skipped) > 0 {
+				infoLog.Printf("Skipping direct reads for namespaces marked complete: %+q", skipped)
+			}
+		}
+	} else if err == mongo.ErrNoDocuments {
+		err = nil
+		results = wanted
+	}
+	return
+}
+
+func (ic *indexClient) saveDirectReadNamespaces() (err error) {
+	col := ic.mongo.Database(ic.config.ConfigDatabaseName).Collection("directreads")
+	filter := bson.M{
+		"_id": ic.config.ResumeName,
+	}
+	ts := time.Now().UTC()
+	update := bson.M{
+		"$set":         bson.M{"updated": ts},
+		"$setOnInsert": bson.M{"created": ts},
+		"$addToSet":    bson.M{"ns": bson.M{"$each": ic.config.DirectReadNs}},
+	}
+	opts := options.Update().SetUpsert(true)
+	_, err = col.UpdateOne(context.Background(), filter, update, opts)
+	return
 }
 
 func (config *configOptions) parseCommandLineFlags() *configOptions {
@@ -1635,6 +1692,7 @@ func (config *configOptions) parseCommandLineFlags() *configOptions {
 	flag.IntVar(&config.DirectReadConcur, "direct-read-concur", 0, "Max number of direct-read-namespaces to read concurrently. By default all givne are read concurrently")
 	flag.BoolVar(&config.DirectReadNoTimeout, "direct-read-no-timeout", false, "True to set the no cursor timeout flag for direct reads")
 	flag.BoolVar(&config.DirectReadBounded, "direct-read-bounded", false, "True to limit direct reads to the docs present at query start time")
+	flag.BoolVar(&config.DirectReadStateful, "direct-read-stateful", false, "True to mark direct read namespaces as complete and not sync them in future runs")
 	flag.Var(&config.RoutingNamespaces, "routing-namespace", "A list of namespaces that override routing information")
 	flag.Var(&config.TimeMachineNamespaces, "time-machine-namespace", "A list of direct read namespaces")
 	flag.StringVar(&config.TimeMachineIndexPrefix, "time-machine-index-prefix", "", "A prefix to preprend to time machine indexes")
@@ -1981,6 +2039,9 @@ func (config *configOptions) loadConfigFile() *configOptions {
 		if !config.DirectReadBounded && tomlConfig.DirectReadBounded {
 			config.DirectReadBounded = true
 		}
+		if !config.DirectReadStateful && tomlConfig.DirectReadStateful {
+			config.DirectReadStateful = true
+		}
 		if !config.ElasticRetry && tomlConfig.ElasticRetry {
 			config.ElasticRetry = true
 		}
@@ -2283,6 +2344,13 @@ func (config *configOptions) loadEnvironment() *configOptions {
 		if val == "" {
 			continue
 		}
+		if strings.HasSuffix(name, "__FILE") {
+			var err error
+			name, val, err = config.loadVariableValueFromFile(name, val)
+			if err != nil {
+				panic(err)
+			}
+		}
 		switch name {
 		case "MONSTACHE_MONGO_URL":
 			if config.MongoURL == "" {
@@ -2453,6 +2521,20 @@ func (config *configOptions) loadEnvironment() *configOptions {
 		}
 	}
 	return config
+}
+
+func (config *configOptions) loadVariableValueFromFile(name string, path string) (n string, v string, err error) {
+	name = strings.TrimSuffix(name, "__FILE")
+	f, err := os.Open(path)
+	if err != nil {
+		return name, "", fmt.Errorf("read value for %s from file failed: %s", name, err)
+	}
+	defer f.Close()
+	c, err := ioutil.ReadAll(f)
+	if err != nil {
+		return name, "", fmt.Errorf("read value for %s from file failed: %s", name, err)
+	}
+	return name, string(c), nil
 }
 
 func (config *configOptions) loadRoutingNamespaces() *configOptions {
@@ -2915,6 +2997,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 		req.UseEasyJSON(ic.config.EnableEasyJSON)
 		req.Id(objectID)
 		req.Index(indexType.Index)
+		req.Pipeline(indexType.Pipeline)
 		req.Doc(op.Data)
 		if meta.ID != "" {
 			req.Id(meta.ID)
@@ -2976,6 +3059,7 @@ func (ic *indexClient) doIndexing(op *gtm.Op) (err error) {
 			req := elastic.NewBulkIndexRequest()
 			req.UseEasyJSON(ic.config.EnableEasyJSON)
 			req.Index(tmIndex(indexType.Index))
+			req.Pipeline(indexType.Pipeline)
 			req.Routing(objectID)
 			req.Doc(data)
 			if meta.Index != "" {
@@ -3254,6 +3338,8 @@ func (meta *indexingMeta) load(metaAttrs map[string]interface{}) {
 		s = fmt.Sprintf("%v", v)
 		if version, err := strconv.ParseInt(s, 10, 64); err == nil {
 			meta.Version = version
+		} else {
+			errorLog.Printf("Error applying version metadata: %s", err)
 		}
 	}
 	if v, ok = metaAttrs["versionType"]; ok {
@@ -3266,6 +3352,8 @@ func (meta *indexingMeta) load(metaAttrs map[string]interface{}) {
 		s = fmt.Sprintf("%v", v)
 		if roc, err := strconv.Atoi(s); err == nil {
 			meta.RetryOnConflict = roc
+		} else {
+			errorLog.Printf("Error applying retryOnConflict metadata: %s", err)
 		}
 	}
 }
@@ -3341,48 +3429,55 @@ func (ic *indexClient) getIndexMeta(namespace, id string) (meta *indexingMeta) {
 }
 
 func loadBuiltinFunctions(client *mongo.Client, config *configOptions) {
-	for ns, env := range mapEnvs {
-		var fa *findConf
-		fa = &findConf{
-			client: client,
-			name:   "findId",
-			vm:     env.VM,
-			ns:     ns,
-			byID:   true,
-		}
-		if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
-			errorLog.Fatalln(err)
-		}
-		fa = &findConf{
-			client: client,
-			name:   "findOne",
-			vm:     env.VM,
-			ns:     ns,
-		}
-		if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
-			errorLog.Fatalln(err)
-		}
-		fa = &findConf{
-			client: client,
-			name:   "find",
-			vm:     env.VM,
-			ns:     ns,
-			multi:  true,
-		}
-		if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
-			errorLog.Fatalln(err)
-		}
-		fa = &findConf{
-			client:        client,
-			name:          "pipe",
-			vm:            env.VM,
-			ns:            ns,
-			multi:         true,
-			pipe:          true,
-			pipeAllowDisk: config.PipeAllowDisk,
-		}
-		if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
-			errorLog.Fatalln(err)
+	scriptEnvMaps := []map[string]*executionEnv{mapEnvs, filterEnvs}
+	loadBuiltinFunctionsForEnvs(scriptEnvMaps, client, config)
+}
+
+func loadBuiltinFunctionsForEnvs(envMaps []map[string]*executionEnv, client *mongo.Client, config *configOptions) {
+	for _, envMap := range envMaps {
+		for ns, env := range envMap {
+			var fa *findConf
+			fa = &findConf{
+				client: client,
+				name:   "findId",
+				vm:     env.VM,
+				ns:     ns,
+				byID:   true,
+			}
+			if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
+				errorLog.Fatalln(err)
+			}
+			fa = &findConf{
+				client: client,
+				name:   "findOne",
+				vm:     env.VM,
+				ns:     ns,
+			}
+			if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
+				errorLog.Fatalln(err)
+			}
+			fa = &findConf{
+				client: client,
+				name:   "find",
+				vm:     env.VM,
+				ns:     ns,
+				multi:  true,
+			}
+			if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
+				errorLog.Fatalln(err)
+			}
+			fa = &findConf{
+				client:        client,
+				name:          "pipe",
+				vm:            env.VM,
+				ns:            ns,
+				multi:         true,
+				pipe:          true,
+				pipeAllowDisk: config.PipeAllowDisk,
+			}
+			if err := env.VM.Set(fa.name, makeFind(fa)); err != nil {
+				errorLog.Fatalln(err)
+			}
 		}
 	}
 }
@@ -4133,12 +4228,17 @@ func (ic *indexClient) stopAllWorkers() {
 }
 
 func (ic *indexClient) startReadWait() {
-	if len(ic.config.DirectReadNs) > 0 {
+	if len(ic.config.DirectReadNs) > 0 || ic.config.ExitAfterDirectReads {
 		go func() {
 			ic.gtmCtx.DirectReadWg.Wait()
 			infoLog.Println("Direct reads completed")
 			if ic.config.Resume {
 				ic.saveTimestampFromReplStatus()
+			}
+			if ic.config.DirectReadStateful && len(ic.config.DirectReadNs) > 0 {
+				if err := ic.saveDirectReadNamespaces(); err != nil {
+					errorLog.Printf("Error saving direct read state: %s", err)
+				}
 			}
 			if ic.config.ExitAfterDirectReads {
 				ic.stopAllWorkers()
@@ -4436,6 +4536,13 @@ func (ic *indexClient) buildGtmOptions() *gtm.Options {
 	if config.dynamicDirectReadList() {
 		config.DirectReadNs = ic.buildDynamicDirectReadNs(nsFilter)
 	}
+	if config.DirectReadStateful {
+		var err error
+		config.DirectReadNs, err = ic.filterDirectReadNamespaces(config.DirectReadNs)
+		if err != nil {
+			errorLog.Fatalf("Error retrieving direct read state: %s", err)
+		}
+	}
 	gtmOpts := &gtm.Options{
 		After:               after,
 		Token:               token,
@@ -4477,29 +4584,8 @@ func (ic *indexClient) clusterWait() {
 		if ic.enabled {
 			infoLog.Printf("Starting work for cluster %s", ic.config.ClusterName)
 		} else {
-			heartBeat := time.NewTicker(10 * time.Second)
-			defer heartBeat.Stop()
 			infoLog.Printf("Pausing work for cluster %s", ic.config.ClusterName)
-			ic.bulk.Stop()
-			wait := true
-			for wait {
-				select {
-				case req := <-ic.statusReqC:
-					req.responseC <- nil
-				case <-heartBeat.C:
-					var err error
-					ic.enabled, err = ic.enableProcess()
-					if err != nil {
-						errorLog.Printf("Error attempting to become active cluster process: %s", err)
-						break
-					}
-					if ic.enabled {
-						infoLog.Printf("Resuming work for cluster %s", ic.config.ClusterName)
-						ic.bulk.Start(context.Background())
-						wait = false
-					}
-				}
-			}
+			ic.waitEnabled()
 		}
 	}
 }
@@ -4549,6 +4635,28 @@ func (ic *indexClient) nextStats() {
 	}
 }
 
+func (ic *indexClient) waitEnabled() {
+	var err error
+	heartBeat := time.NewTicker(10 * time.Second)
+	defer heartBeat.Stop()
+	wait := true
+	for wait {
+		select {
+		case req := <-ic.statusReqC:
+			req.responseC <- nil
+		case <-heartBeat.C:
+			ic.enabled, err = ic.enableProcess()
+			if err != nil {
+				ic.processErr(err)
+			}
+			if ic.enabled {
+				wait = false
+				infoLog.Printf("Resuming work for cluster %s", ic.config.ClusterName)
+			}
+		}
+	}
+}
+
 func (ic *indexClient) nextHeartbeat() {
 	var err error
 	if ic.enabled {
@@ -4558,39 +4666,18 @@ func (ic *indexClient) nextHeartbeat() {
 		}
 		if !ic.enabled {
 			infoLog.Printf("Pausing work for cluster %s", ic.config.ClusterName)
-			ic.gtmCtx.Pause()
-			ic.bulk.Stop()
-			heartBeat := time.NewTicker(10 * time.Second)
-			defer heartBeat.Stop()
-			wait := true
-			for wait {
-				select {
-				case req := <-ic.statusReqC:
-					req.responseC <- nil
-				case <-heartBeat.C:
-					ic.enabled, err = ic.enableProcess()
-					if ic.enabled {
-						wait = false
-						infoLog.Printf("Resuming work for cluster %s", ic.config.ClusterName)
-						ic.bulk.Start(context.Background())
-						ic.resumeWork()
-						break
-					}
-				}
-			}
+			ic.pauseWork()
 		}
 	} else {
 		ic.enabled, err = ic.enableProcess()
+		if err != nil {
+			ic.processErr(err)
+		}
 		if ic.enabled {
 			infoLog.Printf("Resuming work for cluster %s", ic.config.ClusterName)
-			ic.bulk.Start(context.Background())
 			ic.resumeWork()
 		}
 	}
-	if err != nil {
-		ic.processErr(err)
-	}
-
 }
 
 func (ic *indexClient) eventLoop() {
